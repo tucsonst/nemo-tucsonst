@@ -183,6 +183,7 @@ update_info_from_link (NemoDesktopIconFile *icon_file)
 	file->details->type = G_FILE_TYPE_SHORTCUT;
 	file->details->size = 0;
 	file->details->has_permissions = FALSE;
+	file->details->hardlinks = 0;
 	file->details->can_read = TRUE;
 	file->details->can_write = TRUE;
 

@@ -139,6 +139,15 @@ get_builtin_columns (void)
 
 	columns = g_list_append (columns,
 				 g_object_new (NEMO_TYPE_COLUMN,
+					       "name", "hardlinks",
+					       "attribute", "hardlinks",
+					       "label", _("Hard Links"),
+					       "description", _("Count of hards links to the inode."),
+					       "xalign", 1.0,
+					       NULL));
+
+	columns = g_list_append (columns,
+				 g_object_new (NEMO_TYPE_COLUMN,
 					       "name", "mime_type",
 					       "attribute", "mime_type",
 					       "label", _("MIME Type"),

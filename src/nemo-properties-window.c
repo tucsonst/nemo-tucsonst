@@ -2516,6 +2516,12 @@ should_show_modified_date (NemoPropertiesWindow *window)
 }
 
 static gboolean
+should_show_hardlinks (NemoPropertiesWindow *window)
+{
+    return !is_multi_file_window (window);
+}
+
+static gboolean
 should_show_link_target (NemoPropertiesWindow *window)
 {
 	if (!is_multi_file_window (window)
@@ -3206,6 +3212,13 @@ create_basic_page (NemoPropertiesWindow *window)
 	if (should_show_modified_date (window)) {
 		append_title_value_pair (window, grid, _("Modified:"),
 					 "date_modified_full",
+					 INCONSISTENT_STATE_STRING,
+					 FALSE);
+	}
+
+	if (should_show_hardlinks (window)) {
+		append_title_value_pair (window, grid, _("Hard Links:"),
+					 "hardlinks",
 					 INCONSISTENT_STATE_STRING,
 					 FALSE);
 	}

@@ -128,6 +128,7 @@ static GHashTable *symbolic_links;
 
 static GQuark attribute_name_q,
 	attribute_size_q,
+	attribute_hardlinks_q,
 	attribute_type_q,
 	attribute_detailed_type_q,
 	attribute_modification_date_q,
@@ -496,6 +497,8 @@ nemo_file_clear_info (NemoFile *file)
 	file->details->is_media_check_automatic = FALSE;
 	file->details->has_permissions = FALSE;
 	file->details->permissions = 0;
+	file->details->has_hardlinks = FALSE;
+	file->details->hardlinks = 0;
 	file->details->size = -1;
 	file->details->sort_order = 0;
 	file->details->mtime = 0;
@@ -2272,6 +2275,8 @@ update_info_internal (NemoFile *file,
 	gboolean is_symlink, is_hidden, is_mountpoint;
 	gboolean has_permissions;
 	guint32 permissions;
+	gboolean has_hardlinks;
+	guint32 hardlinks;
 	gboolean can_read, can_write, can_execute, can_delete, can_trash, can_rename, can_mount, can_unmount, can_eject;
 	gboolean can_start, can_start_degraded, can_stop, can_poll_for_media, is_media_check_automatic;
 	GDriveStartStopType start_stop_type;
@@ -2390,6 +2395,15 @@ update_info_internal (NemoFile *file,
 	}
 	file->details->has_permissions = has_permissions;
 	file->details->permissions = permissions;
+
+	has_hardlinks = g_file_info_has_attribute (info, G_FILE_ATTRIBUTE_UNIX_NLINK);
+	hardlinks = g_file_info_get_attribute_uint32 (info, G_FILE_ATTRIBUTE_UNIX_NLINK);;
+	if (file->details->has_hardlinks != has_hardlinks ||
+	    file->details->hardlinks != hardlinks) {
+		changed = TRUE;
+	}
+	file->details->has_hardlinks = has_hardlinks;
+	file->details->hardlinks = hardlinks;
 
 	/* We default to TRUE for this if we can't know */
 	can_read = TRUE;
@@ -2565,6 +2579,7 @@ update_info_internal (NemoFile *file,
 		changed = TRUE;
 	}
 	file->details->size = size;
+
 
     sort_order = g_file_info_get_attribute_int32 (info, G_FILE_ATTRIBUTE_STANDARD_SORT_ORDER);
 
@@ -2906,6 +2921,37 @@ get_size (NemoFile *file,
 	*size = file->details->size;
 	return KNOWN;
 }
+
+// static Knowledge
+// get_hardlinks (NemoFile *file,
+// 	  goffset *hardlinks)
+// {
+// 	/* If we tried and failed, then treat it like there is no info
+// 	 * to know.
+// 	 */
+// 	if (file->details->get_info_failed) {
+// 		return UNKNOWABLE;
+// 	}
+
+// 	/* If the info is NULL that means we haven't even tried yet,
+// 	 * so it's just unknown, not unknowable.
+// 	 */
+// 	if (!file->details->got_file_info) {
+// 		return UNKNOWN;
+// 	}
+
+// 	/* If we got info with no hardlink count in it, it means there is no
+// 	 * such thing as a size as far as gnome-vfs is concerned,
+// 	 * so "unknowable".
+// 	 */
+// 	if (file->details->hardlinks == 0) {
+// 		return UNKNOWABLE;
+// 	}
+
+// 	/* We have a hardlink count! */
+// 	*hardlinks = file->details->hardlinks;
+// 	return KNOWN;
+// }
 
 static Knowledge
 get_time (NemoFile *file,
@@ -3531,6 +3577,13 @@ nemo_file_compare_for_sort_by_attribute_q   (NemoFile                   *file_1,
 	} else if (attribute == attribute_size_q) {
 		return nemo_file_compare_for_sort (file_1, file_2,
 						       NEMO_FILE_SORT_BY_SIZE,
+						       directories_first,
+						       favorites_first,
+						       reversed,
+                               search_dir);
+	} else if (attribute == attribute_hardlinks_q) {
+		return nemo_file_compare_for_sort (file_1, file_2,
+						       NEMO_FILE_SORT_BY_LINKS,
 						       directories_first,
 						       favorites_first,
 						       reversed,
@@ -5695,6 +5748,22 @@ nemo_file_can_get_permissions (NemoFile *file)
 }
 
 /**
+ * nemo_file_can_get_hardlinks:
+ *
+ * Check whether the hardlinks for a file are determinable.
+ * This might not be the case for files on non-UNIX file systems.
+ *
+ * @file: The file in question.
+ *
+ * Return value: TRUE if the hardlink count is valid.
+ */
+gboolean
+nemo_file_can_get_hardlinks (NemoFile *file)
+{
+	return file->details->has_hardlinks;
+}
+
+/**
  * nemo_file_can_set_permissions:
  *
  * Check whether the current user is allowed to change
@@ -6431,6 +6500,32 @@ nemo_file_get_octal_permissions_as_string (NemoFile *file)
 }
 
 /**
+ * nemo_file_get_hardlinks_as_string:
+ *
+ * Get a user-displayable string representing the number of links to
+ * this file's inode. The caller
+ * is responsible for g_free-ing this string.
+ * @file: NemoFile representing the file in question.
+ *
+ * Returns: Newly allocated string ready to display to the user.
+ *
+ **/
+static char *
+nemo_file_get_hardlinks_as_string (NemoFile *file)
+{
+	guint32 hardlinks;
+
+	g_assert (NEMO_IS_FILE (file));
+
+ 	if (!nemo_file_can_get_hardlinks (file)) {
+		return NULL;
+	}
+
+	hardlinks = file->details->hardlinks;
+	return g_strdup_printf ("%d", hardlinks);
+}
+
+/**
  * nemo_file_get_permissions_as_string:
  *
  * Get a user-displayable string representing a file's permissions. The caller
@@ -6802,6 +6897,9 @@ nemo_file_get_string_attribute_q (NemoFile *file, GQuark attribute_q)
 	}
 	if (attribute_q == attribute_size_q) {
 		return nemo_file_get_size_as_string (file);
+	}
+	if (attribute_q == attribute_hardlinks_q) {
+		return nemo_file_get_hardlinks_as_string (file);
 	}
 	if (attribute_q == attribute_size_detail_q) {
 		return nemo_file_get_size_as_string_with_real_size (file);
@@ -8990,6 +9088,7 @@ nemo_file_class_init (NemoFileClass *class)
 
 	attribute_name_q = g_quark_from_static_string ("name");
 	attribute_size_q = g_quark_from_static_string ("size");
+	attribute_hardlinks_q = g_quark_from_static_string ("hardlinks");
 	attribute_type_q = g_quark_from_static_string ("type");
     attribute_detailed_type_q = g_quark_from_static_string ("detailed_type");
 	attribute_modification_date_q = g_quark_from_static_string ("modification_date");
