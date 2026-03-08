@@ -142,7 +142,16 @@ get_builtin_columns (void)
 					       "name", "hardlinks",
 					       "attribute", "hardlinks",
 					       "label", _("Hard Links"),
-					       "description", _("Count of hards links to the inode."),
+					       "description", _("Count of hard links to the inode."),
+					       "xalign", 1.0,
+					       NULL));
+
+	columns = g_list_append (columns,
+				 g_object_new (NEMO_TYPE_COLUMN,
+					       "name", "inode",
+					       "attribute", "inode",
+					       "label", _("inode"),
+					       "description", _("The file's inode number."),
 					       "xalign", 1.0,
 					       NULL));
 

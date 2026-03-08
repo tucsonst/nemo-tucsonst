@@ -72,6 +72,7 @@ struct NemoFileDetails
 	int gid; /* -1 is none */
 
 	guint32 hardlinks;
+	guint64 inode;
 
 	GRefString *owner;
 	GRefString *owner_real;
@@ -226,6 +227,7 @@ struct NemoFileDetails
 	eel_boolean_bit filesystem_use_preview        : 2; /* GFilesystemPreviewType */
     eel_boolean_bit filesystem_info_is_up_to_date : 1;
     eel_boolean_bit has_hardlinks : 1;
+    eel_boolean_bit has_inode : 1;
 
     NemoFileLoadDeferredAttrs load_deferred_attrs;
     NemoFileMetaState pinning;
