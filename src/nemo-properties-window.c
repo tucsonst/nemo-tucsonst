@@ -2522,6 +2522,12 @@ should_show_hardlinks (NemoPropertiesWindow *window)
 }
 
 static gboolean
+should_show_inode (NemoPropertiesWindow *window)
+{
+    return !is_multi_file_window (window);
+}
+
+static gboolean
 should_show_link_target (NemoPropertiesWindow *window)
 {
 	if (!is_multi_file_window (window)
@@ -3219,6 +3225,13 @@ create_basic_page (NemoPropertiesWindow *window)
 	if (should_show_hardlinks (window)) {
 		append_title_value_pair (window, grid, _("Hard Links:"),
 					 "hardlinks",
+					 INCONSISTENT_STATE_STRING,
+					 FALSE);
+	}
+
+	if (should_show_inode (window)) {
+		append_title_value_pair (window, grid, _("inode:"),
+					 "inode",
 					 INCONSISTENT_STATE_STRING,
 					 FALSE);
 	}
