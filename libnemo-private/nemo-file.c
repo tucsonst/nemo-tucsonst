@@ -129,6 +129,7 @@ static GHashTable *symbolic_links;
 static GQuark attribute_name_q,
 	attribute_size_q,
 	attribute_hardlinks_q,
+	attribute_inode_q,
 	attribute_type_q,
 	attribute_detailed_type_q,
 	attribute_modification_date_q,
@@ -499,6 +500,8 @@ nemo_file_clear_info (NemoFile *file)
 	file->details->permissions = 0;
 	file->details->has_hardlinks = FALSE;
 	file->details->hardlinks = 0;
+	file->details->has_inode = FALSE;
+	file->details->inode = 0;
 	file->details->size = -1;
 	file->details->sort_order = 0;
 	file->details->mtime = 0;
@@ -2277,6 +2280,8 @@ update_info_internal (NemoFile *file,
 	guint32 permissions;
 	gboolean has_hardlinks;
 	guint32 hardlinks;
+	gboolean has_inode;
+	guint64 inode;
 	gboolean can_read, can_write, can_execute, can_delete, can_trash, can_rename, can_mount, can_unmount, can_eject;
 	gboolean can_start, can_start_degraded, can_stop, can_poll_for_media, is_media_check_automatic;
 	GDriveStartStopType start_stop_type;
@@ -2404,6 +2409,15 @@ update_info_internal (NemoFile *file,
 	}
 	file->details->has_hardlinks = has_hardlinks;
 	file->details->hardlinks = hardlinks;
+
+	has_inode = g_file_info_has_attribute (info, G_FILE_ATTRIBUTE_UNIX_INODE);
+	inode = g_file_info_get_attribute_uint64 (info, G_FILE_ATTRIBUTE_UNIX_INODE);;
+	if (file->details->has_inode != has_inode ||
+	    file->details->inode != inode) {
+		changed = TRUE;
+	}
+	file->details->has_inode = has_inode;
+	file->details->inode= inode;
 
 	/* We default to TRUE for this if we can't know */
 	can_read = TRUE;
@@ -2922,36 +2936,67 @@ get_size (NemoFile *file,
 	return KNOWN;
 }
 
-// static Knowledge
-// get_hardlinks (NemoFile *file,
-// 	  goffset *hardlinks)
-// {
-// 	/* If we tried and failed, then treat it like there is no info
-// 	 * to know.
-// 	 */
-// 	if (file->details->get_info_failed) {
-// 		return UNKNOWABLE;
-// 	}
+static Knowledge
+get_hardlinks (NemoFile *file,
+	  guint32 *hardlinks)
+{
+	/* If we tried and failed, then treat it like there is no info
+	 * to know.
+	 */
+	if (file->details->get_info_failed) {
+		return UNKNOWABLE;
+	}
 
-// 	/* If the info is NULL that means we haven't even tried yet,
-// 	 * so it's just unknown, not unknowable.
-// 	 */
-// 	if (!file->details->got_file_info) {
-// 		return UNKNOWN;
-// 	}
+	/* If the info is NULL that means we haven't even tried yet,
+	 * so it's just unknown, not unknowable.
+	 */
+	if (!file->details->got_file_info) {
+		return UNKNOWN;
+	}
 
-// 	/* If we got info with no hardlink count in it, it means there is no
-// 	 * such thing as a size as far as gnome-vfs is concerned,
-// 	 * so "unknowable".
-// 	 */
-// 	if (file->details->hardlinks == 0) {
-// 		return UNKNOWABLE;
-// 	}
+	/* If we got info with no hardlink count in it, it means there is no
+	 * such thing as a size as far as gnome-vfs is concerned,
+	 * so "unknowable".
+	 */
+	if (file->details->hardlinks == 0) {
+		return UNKNOWABLE;
+	}
 
-// 	/* We have a hardlink count! */
-// 	*hardlinks = file->details->hardlinks;
-// 	return KNOWN;
-// }
+	/* We have a hardlink count! */
+	*hardlinks = file->details->hardlinks;
+	return KNOWN;
+}
+
+static Knowledge
+get_inode (NemoFile *file,
+	  guint64 *inode)
+{
+	/* If we tried and failed, then treat it like there is no info
+	 * to know.
+	 */
+	if (file->details->get_info_failed) {
+		return UNKNOWABLE;
+	}
+
+	/* If the info is NULL that means we haven't even tried yet,
+	 * so it's just unknown, not unknowable.
+	 */
+	if (!file->details->got_file_info) {
+		return UNKNOWN;
+	}
+
+	/* If we got info with no inode in it, it means there is no
+	 * such thing as a size as far as gnome-vfs is concerned,
+	 * so "unknowable".
+	 */
+	if (file->details->hardlinks == 0) {
+		return UNKNOWABLE;
+	}
+
+	/* We have a hardlink count! */
+	*inode = file->details->inode;
+	return KNOWN;
+}
 
 static Knowledge
 get_time (NemoFile *file,
@@ -3120,6 +3165,146 @@ compare_by_size (NemoFile *file_1, NemoFile *file_2)
 	} else {
 		return compare_files_by_size (file_1, file_2);
 	}
+}
+
+
+static int
+compare_files_by_hardlinks (NemoFile *file_1, NemoFile *file_2)
+{
+	/* Sort order:
+	 *   Files with unknown hardlinks.
+	 *   Files with "unknowable" hardlinks.
+	 *   Files with smaller hardlinks count.
+	 *   Files with larger hardlinks count.
+	 */
+
+	Knowledge hardlinks_known_1, hardlinks_known_2;
+	guint32 hardlinks_1 = 0, hardlinks_2 = 0;
+
+	hardlinks_known_1 = get_hardlinks (file_1, &hardlinks_1);
+	hardlinks_known_2 = get_hardlinks (file_2, &hardlinks_2);
+
+	if (hardlinks_known_1 > hardlinks_known_2) {
+		return -1;
+	}
+	if (hardlinks_known_1 < hardlinks_known_2) {
+		return +1;
+	}
+
+	/* hardlinks_known_1 and hardlinks_known_2 are equal now. Check if hardlinks
+	 * details are UNKNOWABLE or UNKNOWN
+	 */
+	if (hardlinks_known_1 == UNKNOWABLE || hardlinks_known_1 == UNKNOWN) {
+		return 0;
+	}
+
+	if (hardlinks_1 < hardlinks_2) {
+		return -1;
+	}
+	if (hardlinks_1 > hardlinks_2) {
+		return +1;
+	}
+
+	return 0;
+}
+
+static int
+compare_by_hardlinks (NemoFile *file_1, NemoFile *file_2)
+{
+	/* Sort order:
+	 *   Directories with n hardlinks
+	 *   Directories with 0 hardlinks (should be impossible?)
+	 *   Directories with "unknowable" hardlinks
+	 *   Directories with unknown # of hardlinks
+	 *   Files with larger hardlinks count.
+	 *   Files with smaller hardlinks count.
+	 *   Files with "unknowable" hardlinks.
+	 *   Files with unknown hardlinks.
+	 */
+
+	gboolean is_directory_1, is_directory_2;
+
+	is_directory_1 = nemo_file_is_directory (file_1);
+	is_directory_2 = nemo_file_is_directory (file_2);
+
+	if (is_directory_1 && !is_directory_2) {
+		return -1;
+	}
+	if (is_directory_2 && !is_directory_1) {
+		return +1;
+	}
+
+	return compare_files_by_hardlinks (file_1, file_2);
+}
+
+
+static int
+compare_files_by_inode (NemoFile *file_1, NemoFile *file_2)
+{
+	/* Sort order:
+	 *   Files with unknown inode.
+	 *   Files with "unknowable" inode.
+	 *   Files with smaller inode.
+	 *   Files with larger inode.
+	 */
+
+	Knowledge inode_known_1, inode_known_2;
+	guint64 inode_1 = 0, inode_2 = 0;
+
+	inode_known_1 = get_inode (file_1, &inode_1);
+	inode_known_2 = get_inode (file_2, &inode_2);
+
+	if (inode_known_1 > inode_known_2) {
+		return -1;
+	}
+	if (inode_known_1 < inode_known_2) {
+		return +1;
+	}
+
+	/* inode_known_1 and inode_known_2 are equal now. Check if inode
+	 * details are UNKNOWABLE or UNKNOWN
+	 */
+	if (inode_known_1 == UNKNOWABLE || inode_known_1 == UNKNOWN) {
+		return 0;
+	}
+
+	if (inode_1 < inode_2) {
+		return -1;
+	}
+	if (inode_1 > inode_2) {
+		return +1;
+	}
+
+	return 0;
+}
+
+static int
+compare_by_inode (NemoFile *file_1, NemoFile *file_2)
+{
+	/* Sort order:
+	 *   Directories with n inode
+	 *   Directories with 0 inode (should be impossible?)
+	 *   Directories with "unknowable" inode
+	 *   Directories with unknown inode
+	 *   Files with larger inode.
+	 *   Files with smaller inode.
+	 *   Files with "unknowable" inode.
+	 *   Files with unknown inode.
+	 */
+
+	gboolean is_directory_1, is_directory_2;
+
+	is_directory_1 = nemo_file_is_directory (file_1);
+	is_directory_2 = nemo_file_is_directory (file_2);
+
+	if (is_directory_1 && !is_directory_2) {
+		return -1;
+	}
+	if (is_directory_2 && !is_directory_1) {
+		return +1;
+	}
+
+	return compare_files_by_inode (file_1, file_2);
 }
 
 static int
@@ -3488,6 +3673,20 @@ nemo_file_compare_for_sort (NemoFile *file_1,
 				result = compare_by_full_path (file_1, file_2);
 			}
 			break;
+		case NEMO_FILE_SORT_BY_LINKS:
+			/* Compare link counts
+			 */
+			result = compare_by_hardlinks (file_1, file_2);
+			if (result == 0) {
+			}
+			break;
+		case NEMO_FILE_SORT_BY_INODE:
+			/* Compare inode number
+			 */
+			result = compare_by_inode (file_1, file_2);
+			if (result == 0) {
+			}
+			break;
 		case NEMO_FILE_SORT_BY_TYPE:
 			result = compare_by_type (file_1, file_2, FALSE);
 			if (result == 0) {
@@ -3584,6 +3783,13 @@ nemo_file_compare_for_sort_by_attribute_q   (NemoFile                   *file_1,
 	} else if (attribute == attribute_hardlinks_q) {
 		return nemo_file_compare_for_sort (file_1, file_2,
 						       NEMO_FILE_SORT_BY_LINKS,
+						       directories_first,
+						       favorites_first,
+						       reversed,
+                               search_dir);
+	} else if (attribute == attribute_inode_q) {  //Not sure it's useful to sort by inode but...
+		return nemo_file_compare_for_sort (file_1, file_2,
+						       NEMO_FILE_SORT_BY_INODE,
 						       directories_first,
 						       favorites_first,
 						       reversed,
@@ -5764,6 +5970,22 @@ nemo_file_can_get_hardlinks (NemoFile *file)
 }
 
 /**
+ * nemo_file_can_get_inode:
+ *
+ * Check whether the inode for a file is determinable.
+ * This might not be the case for files on non-UNIX file systems.
+ *
+ * @file: The file in question.
+ *
+ * Return value: TRUE if the inode is valid.
+ */
+gboolean
+nemo_file_can_get_inode (NemoFile *file)
+{
+	return file->details->has_inode;
+}
+
+/**
  * nemo_file_can_set_permissions:
  *
  * Check whether the current user is allowed to change
@@ -6526,6 +6748,32 @@ nemo_file_get_hardlinks_as_string (NemoFile *file)
 }
 
 /**
+ * nemo_file_get_inode_as_string:
+ *
+ * Get a user-displayable string representing 
+ * this file's inode. The caller
+ * is responsible for g_free-ing this string.
+ * @file: NemoFile representing the file in question.
+ *
+ * Returns: Newly allocated string ready to display to the user.
+ *
+ **/
+static char *
+nemo_file_get_inode_as_string (NemoFile *file)
+{
+	guint64 inode;
+
+	g_assert (NEMO_IS_FILE (file));
+
+ 	if (!nemo_file_can_get_inode (file)) {
+		return NULL;
+	}
+
+	inode = file->details->inode;
+	return g_strdup_printf ("%ld", inode);
+}
+
+/**
  * nemo_file_get_permissions_as_string:
  *
  * Get a user-displayable string representing a file's permissions. The caller
@@ -6900,6 +7148,9 @@ nemo_file_get_string_attribute_q (NemoFile *file, GQuark attribute_q)
 	}
 	if (attribute_q == attribute_hardlinks_q) {
 		return nemo_file_get_hardlinks_as_string (file);
+	}
+	if (attribute_q == attribute_inode_q) {
+		return nemo_file_get_inode_as_string (file);
 	}
 	if (attribute_q == attribute_size_detail_q) {
 		return nemo_file_get_size_as_string_with_real_size (file);
@@ -9089,6 +9340,7 @@ nemo_file_class_init (NemoFileClass *class)
 	attribute_name_q = g_quark_from_static_string ("name");
 	attribute_size_q = g_quark_from_static_string ("size");
 	attribute_hardlinks_q = g_quark_from_static_string ("hardlinks");
+	attribute_inode_q = g_quark_from_static_string ("inode");
 	attribute_type_q = g_quark_from_static_string ("type");
     attribute_detailed_type_q = g_quark_from_static_string ("detailed_type");
 	attribute_modification_date_q = g_quark_from_static_string ("modification_date");
