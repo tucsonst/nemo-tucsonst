@@ -30,6 +30,7 @@
 
 #include "nemo-application.h"
 #include "nemo-list-model.h"
+#include <libnemo-private/nemo-fzy-utils.h>
 #include "nemo-error-reporting.h"
 #include "nemo-view-dnd.h"
 #include "nemo-view-factory.h"
@@ -271,6 +272,8 @@ get_default_sort_order (NemoFile *file, gboolean *reversed)
 
 	return retval;
 }
+
+static void nemo_list_view_update_filter_text (NemoView *view, const char *filter_text);
 
 static void
 tooltip_prefs_changed_callback (NemoListView *view)
@@ -1527,6 +1530,10 @@ key_press_callback (GtkWidget *widget, GdkEventKey *event, gpointer callback_dat
 		handled = TRUE;
 		break;
 	case GDK_KEY_space:
+		if (nemo_view_activate_filter (view, event)) {
+			handled = TRUE;
+			break;
+		}
 		if (event->state & GDK_CONTROL_MASK) {
 			handled = FALSE;
 			break;
@@ -1560,6 +1567,10 @@ key_press_callback (GtkWidget *widget, GdkEventKey *event, gpointer callback_dat
 
 	default:
 		handled = FALSE;
+	}
+
+	if (!handled) {
+		handled = nemo_view_activate_filter (view, event);
 	}
 
 	return handled;
@@ -1701,19 +1712,6 @@ sort_column_changed_callback (GtkTreeSortable *sortable,
 	view->details->last_sort_attr = sort_attr;
 }
 
-static gboolean
-editable_focus_out_cb (GtkWidget *widget,
-		       GdkEvent *event,
-		       gpointer user_data)
-{
-	NemoListView *view = user_data;
-
-	nemo_view_set_is_renaming (NEMO_VIEW (view), FALSE);
-	nemo_view_unfreeze_updates (NEMO_VIEW (view));
-
-    return GDK_EVENT_PROPAGATE;
-}
-
 static void
 cell_renderer_editing_started_cb (GtkCellRenderer *renderer,
 				  GtkCellEditable *editable,
@@ -1730,8 +1728,11 @@ cell_renderer_editing_started_cb (GtkCellRenderer *renderer,
 
 	list_view->details->original_name = g_strdup (gtk_entry_get_text (entry));
 
-	g_signal_connect (entry, "focus-out-event",
-			  G_CALLBACK (editable_focus_out_cb), list_view);
+    g_signal_handlers_block_matched (entry,
+                                     G_SIGNAL_MATCH_ID | G_SIGNAL_MATCH_DATA,
+                                     g_signal_lookup ("focus-out-event", GTK_TYPE_WIDGET),
+                                     0, NULL, NULL,
+                                     renderer);
 
 	nemo_clipboard_set_up_editable
 		(GTK_EDITABLE (entry),
@@ -2269,11 +2270,50 @@ filename_cell_data_func (GtkTreeViewColumn *column,
 		underline = PANGO_UNDERLINE_NONE;
 	}
 
-	g_object_set (G_OBJECT (renderer),
-		      "text", text,
-		      "underline", underline,
-              "weight", weight,
-		      NULL);
+	if (text != NULL && nemo_list_model_get_filter_active (view->details->model)) {
+		const char *filter_text = nemo_view_get_filter_text (NEMO_VIEW (view));
+		PangoAttrList *match_attrs = nemo_fzy_match_attrs (filter_text, text);
+
+		if (match_attrs != NULL) {
+			PangoAttrList *attrs = pango_attr_list_new ();
+			PangoAttribute *base = pango_attr_weight_new (weight);
+			PangoAttrIterator *iter;
+
+			pango_attr_list_insert (attrs, base);
+
+			iter = pango_attr_list_get_iterator (match_attrs);
+			do {
+				PangoAttribute *a = pango_attr_iterator_get (iter, PANGO_ATTR_WEIGHT);
+				if (a != NULL) {
+					pango_attr_list_change (attrs, pango_attribute_copy (a));
+				}
+			} while (pango_attr_iterator_next (iter));
+			pango_attr_iterator_destroy (iter);
+			pango_attr_list_unref (match_attrs);
+
+			g_object_set (G_OBJECT (renderer),
+			              "text", text,
+			              "underline", underline,
+			              "weight-set", FALSE,
+			              "attributes", attrs,
+			              NULL);
+			pango_attr_list_unref (attrs);
+		} else {
+			g_object_set (G_OBJECT (renderer),
+			              "text", text,
+			              "underline", underline,
+			              "weight", weight,
+			              "attributes", NULL,
+			              NULL);
+		}
+	} else {
+		g_object_set (G_OBJECT (renderer),
+		              "text", text,
+		              "underline", underline,
+		              "weight", weight,
+		              "attributes", NULL,
+		              NULL);
+	}
 
     g_free (text);
 }
@@ -2393,6 +2433,14 @@ get_icon_scale_callback (NemoListModel *model,
                          NemoListView  *view)
 {
    return gtk_widget_get_scale_factor (GTK_WIDGET (view->details->tree_view));
+}
+
+static gint
+get_filter_match_callback (NemoListModel *model,
+                           NemoFile      *file,
+                           NemoListView  *view)
+{
+    return nemo_view_get_filter_match (NEMO_VIEW (view), file);
 }
 
 static void
@@ -2537,7 +2585,7 @@ create_and_set_up_tree_view (NemoListView *view)
 							(GDestroyNotify) g_free,
 							NULL);
 
-	gtk_tree_view_set_enable_search (view->details->tree_view, TRUE);
+	gtk_tree_view_set_enable_search (view->details->tree_view, FALSE);
 
 	/* Don't handle backspace key. It's used to open the parent folder. */
 	binding_set = gtk_binding_set_by_class (GTK_WIDGET_GET_CLASS (view->details->tree_view));
@@ -2627,6 +2675,8 @@ create_and_set_up_tree_view (NemoListView *view)
 
     g_signal_connect_object (view->details->model, "get-icon-scale",
                  G_CALLBACK (get_icon_scale_callback), view, 0);
+    g_signal_connect_object (view->details->model, "get-filter-match",
+                 G_CALLBACK (get_filter_match_callback), view, 0);
 
 	gtk_tree_selection_set_mode (gtk_tree_view_get_selection (view->details->tree_view), GTK_SELECTION_MULTIPLE);
 	gtk_tree_view_set_rules_hint (view->details->tree_view, TRUE);
@@ -4318,6 +4368,26 @@ nemo_list_view_get_id (NemoView *view)
 	return NEMO_LIST_VIEW_ID;
 }
 
+static const gchar *
+nemo_list_view_get_sort_attribute (NemoView *view)
+{
+	NemoListView *list_view = NEMO_LIST_VIEW (view);
+	gint sort_column_id;
+	GtkSortType order;
+	GQuark attribute;
+
+	if (!gtk_tree_sortable_get_sort_column_id (
+			GTK_TREE_SORTABLE (list_view->details->model),
+			&sort_column_id, &order)) {
+		return NULL;
+	}
+
+	attribute = nemo_list_model_get_attribute_from_sort_column_id (
+		list_view->details->model, sort_column_id);
+
+	return attribute != 0 ? g_quark_to_string (attribute) : NULL;
+}
+
 static void
 nemo_list_view_class_init (NemoListViewClass *class)
 {
@@ -4356,6 +4426,7 @@ nemo_list_view_class_init (NemoListViewClass *class)
 	nemo_view_class->set_selection = nemo_list_view_set_selection;
 	nemo_view_class->invert_selection = nemo_list_view_invert_selection;
 	nemo_view_class->compare_files = nemo_list_view_compare_files;
+	nemo_view_class->update_filter_text = nemo_list_view_update_filter_text;
 	nemo_view_class->sort_directories_first_changed = nemo_list_view_sort_directories_first_changed;
 	nemo_view_class->sort_favorites_first_changed = nemo_list_view_sort_favorites_first_changed;
 	nemo_view_class->start_renaming_file = nemo_list_view_start_renaming_file;
@@ -4367,6 +4438,7 @@ nemo_list_view_class_init (NemoListViewClass *class)
 	nemo_view_class->get_first_visible_file = nemo_list_view_get_first_visible_file;
 	nemo_view_class->scroll_to_file = list_view_scroll_to_file;
     nemo_view_class->click_to_rename_mode_changed = nemo_list_view_click_to_rename_mode_changed;
+	nemo_view_class->get_sort_attribute = nemo_list_view_get_sort_attribute;
 }
 
 static void
@@ -4515,4 +4587,14 @@ GtkTreeView*
 nemo_list_view_get_tree_view (NemoListView *list_view)
 {
 	return list_view->details->tree_view;
+}
+
+static void
+nemo_list_view_update_filter_text (NemoView   *view,
+                                   const char *filter_text)
+{
+    NemoListView *list_view = NEMO_LIST_VIEW (view);
+
+    nemo_list_model_set_filter_active (list_view->details->model,
+                                       filter_text != NULL && filter_text[0] != '\0');
 }

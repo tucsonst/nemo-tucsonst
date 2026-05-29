@@ -69,11 +69,15 @@
 #include <libnemo-private/nemo-search-directory.h>
 #include <libnemo-private/nemo-directory.h>
 #include <libnemo-private/nemo-dnd.h>
+#include <libnemo-private/nemo-file.h>
 #include <libnemo-private/nemo-file-attributes.h>
 #include <libnemo-private/nemo-file-changes-queue.h>
 #include <libnemo-private/nemo-file-dnd.h>
 #include <libnemo-private/nemo-file-operations.h>
 #include <libnemo-private/nemo-file-utilities.h>
+#include <libnemo-private/nemo-malloc-utils.h>
+#include <libnemo-private/fzy-match.h>
+#include <libnemo-private/nemo-fzy-utils.h>
 #include <libnemo-private/nemo-file-private.h>
 #include <libnemo-private/nemo-global-preferences.h>
 #include <libnemo-private/nemo-link.h>
@@ -95,8 +99,11 @@
 #define DEBUG_FLAG NEMO_DEBUG_DIRECTORY_VIEW
 #include <libnemo-private/nemo-debug.h>
 
-/* Minimum starting update inverval */
-#define UPDATE_INTERVAL_MIN 200
+/* Minimum starting update interval for progressive display */
+#define UPDATE_INTERVAL_MIN 10
+/* One-shot pre-render delay in deferred mode (sort by folder size, deep counts etc.),
+ * to give async deep counts a chance to arrive before the first render. */
+#define UPDATE_INTERVAL_DEFERRED 50
 /* Maximum update interval */
 #define UPDATE_INTERVAL_MAX 2000
 /* Amount of miliseconds the update interval is increased */
@@ -112,6 +119,8 @@
 #define DUPLICATE_VERTICAL_ICON_OFFSET   30
 
 #define MAX_QUEUED_UPDATES 250
+/* Max files to hold before falling back to progressive display during loading */
+#define MAX_LOADING_PENDING_HELD 500
 
 #define SELECTION_CHANGED_UPDATE_INTERVAL 50
 
@@ -168,7 +177,7 @@ enum {
 	SELECTION_CHANGED,
 	TRASH,
 	DELETE,
-    SHOW_DROP_BAR,
+    ACTIVATE_FILTER,
 	LAST_SIGNAL
 };
 
@@ -267,6 +276,9 @@ struct NemoViewDetails
 	gboolean updates_frozen;
 	guint	 updates_queued;
 	gboolean needs_reload;
+	guint    loading_pending_held;
+	const gchar *display_method;
+	gdouble  first_render_elapsed;
 
 	gboolean is_renaming;
 
@@ -307,6 +319,14 @@ struct NemoViewDetails
     GTimer *load_timer;
 
     char *detail_string;
+
+    /* Type-to-filter */
+    gchar *filter_text;
+    gchar *filter_text_stripped;
+    gboolean filter_active;
+    gboolean filter_navigation_blocked;
+    guint filter_debounce_id;
+    GHashTable *filter_score_cache;
 };
 
 typedef struct {
@@ -329,6 +349,9 @@ static void     trash_or_delete_files                          (GtkWindow       
 								NemoView      *view);
 static void     load_directory                                 (NemoView      *view,
 								NemoDirectory    *directory);
+static void     nemo_view_apply_filter                         (NemoView      *view);
+static void     reset_filter_state                             (NemoView      *view);
+
 static void     nemo_view_merge_menus                      (NemoView      *view);
 static void     nemo_view_unmerge_menus                    (NemoView      *view);
 static void     nemo_view_init_show_hidden_files           (NemoView      *view);
@@ -2717,6 +2740,9 @@ nemo_view_init (NemoView *view)
 				       (GDestroyNotify)file_and_directory_free,
 				       NULL);
 
+	view->details->filter_score_cache =
+		g_hash_table_new (g_direct_hash, g_direct_equal);
+
 	gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (view),
 					GTK_POLICY_AUTOMATIC,
 					GTK_POLICY_AUTOMATIC);
@@ -2955,6 +2981,8 @@ nemo_view_destroy (GtkWidget *object)
 		view->details->delayed_rename_file_id = 0;
 	}
 
+	reset_filter_state (view);
+
 	if (view->details->model) {
 		nemo_directory_unref (view->details->model);
 		view->details->model = NULL;
@@ -3010,7 +3038,10 @@ nemo_view_finalize (GObject *object)
 
     g_clear_pointer (&view->details->detail_string, g_free);
 
+    reset_filter_state (view);
+
 	g_hash_table_destroy (view->details->non_ready_files);
+	g_hash_table_destroy (view->details->filter_score_cache);
 
 	G_OBJECT_CLASS (nemo_view_parent_class)->finalize (object);
 }
@@ -3355,7 +3386,13 @@ done_loading (NemoView *view,
             g_clear_pointer (&nemo_startup_timer, g_timer_destroy);
         }
 
-        g_printerr ("Folder load time: %f seconds\n", g_timer_elapsed (view->details->load_timer, NULL));
+        gchar *uri = nemo_view_get_uri (view);
+        g_printerr ("Folder load time: %f seconds. First render: %.0fms. Method: %s. URI: %s\n",
+                    g_timer_elapsed (view->details->load_timer, NULL),
+                    view->details->first_render_elapsed,
+                    view->details->display_method,
+                    uri);
+        g_free (uri);
 
         g_idle_add_full (1000, (GSourceFunc) idle_timer_report, view, NULL);
     }
@@ -3637,6 +3674,9 @@ process_new_files (NemoView *view)
 
 	new_added_files = view->details->new_added_files;
 	view->details->new_added_files = NULL;
+
+	if (view->details->first_render_elapsed < 0.0 && new_added_files != NULL)
+		view->details->first_render_elapsed = g_timer_elapsed (view->details->load_timer, NULL) * 1000.0;
 	new_changed_files = view->details->new_changed_files;
 	view->details->new_changed_files = NULL;
 
@@ -3732,6 +3772,8 @@ process_old_files (NemoView *view)
 
 		for (node = files_changed; node != NULL; node = node->next) {
 			pending = node->data;
+			g_hash_table_remove (view->details->filter_score_cache,
+			                     pending->file);
 			g_signal_emit (view,
 				       signals[still_should_show_file (view, pending->file, pending->directory)
 					       ? FILE_CHANGED : REMOVE_FILE], 0,
@@ -3772,6 +3814,8 @@ display_pending_files (NemoView *view)
 	if (view->details->updates_frozen) {
 		return;
 	}
+
+	view->details->loading_pending_held = 0;
 
 	process_new_files (view);
 	process_old_files (view);
@@ -3945,7 +3989,21 @@ queue_pending_files (NemoView *view,
 	*pending_list = g_list_concat (file_and_directory_list_from_files (directory, files),
 				       *pending_list);
 
-    schedule_timeout_display_of_pending_files (view, view->details->update_interval);
+	/* During loading of a normal local directory, hold files in the pending
+	 * list and let done_loading_callback flush them all at once. For search,
+	 * non-native filesystems, post-load changes, or very large directories,
+	 * show progressively. */
+	view->details->loading_pending_held += g_list_length (files);
+
+	gboolean schedule = !view->details->loading ||
+	                    nemo_directory_are_all_files_seen (directory) ||
+	                    nemo_directory_is_in_search (directory) ||
+	                    !g_file_is_native (nemo_directory_get_location (directory)) ||
+	                    view->details->loading_pending_held > MAX_LOADING_PENDING_HELD;
+
+	if (schedule) {
+		schedule_timeout_display_of_pending_files (view, view->details->update_interval);
+	}
 }
 
 static void
@@ -4072,6 +4130,28 @@ files_changed_callback (NemoDirectory *directory,
 }
 
 static void
+display_pending_files_with_tradeoff (NemoView *view)
+{
+	NemoViewClass *klass = NEMO_VIEW_GET_CLASS (view);
+	const gchar *sort_attribute = NULL;
+
+	if (klass->get_sort_attribute != NULL) {
+		sort_attribute = klass->get_sort_attribute (view);
+	}
+
+	gboolean fast = sort_attribute == NULL || !nemo_file_attribute_slow_sort (sort_attribute);
+	view->details->display_method = fast ? "immediate" : "deferred";
+
+	unschedule_display_of_pending_files (view);
+
+	if (fast) {
+		display_pending_files (view);
+	} else {
+		schedule_timeout_display_of_pending_files (view, UPDATE_INTERVAL_DEFERRED);
+	}
+}
+
+static void
 done_loading_callback (NemoDirectory *directory,
 		       gpointer callback_data)
 {
@@ -4081,13 +4161,10 @@ done_loading_callback (NemoDirectory *directory,
 
 	process_new_files (view);
 	if (g_hash_table_size (view->details->non_ready_files) == 0) {
-		/* Unschedule a pending update and schedule a new one with the minimal
-		 * update interval. This gives the view a short chance at gathering the
-		 * (cached) deep counts.
-		 */
-		unschedule_display_of_pending_files (view);
-		schedule_timeout_display_of_pending_files (view, UPDATE_INTERVAL_MIN);
+		display_pending_files_with_tradeoff (view);
 	}
+
+	nemo_schedule_heap_trim ();
 }
 
 static void
@@ -10334,6 +10411,10 @@ nemo_view_notify_selection_changed (NemoView *view)
 
 	view->details->selection_was_removed = FALSE;
 
+	if (view->details->filter_navigation_blocked && !view->details->filter_active) {
+		view->details->filter_navigation_blocked = FALSE;
+	}
+
 	if (!view->details->selection_change_is_due_to_shell) {
 		view->details->send_selection_change_to_shell = TRUE;
 	}
@@ -10394,9 +10475,21 @@ load_directory (NemoView *view,
 	g_assert (NEMO_IS_DIRECTORY (directory));
 
 	nemo_view_stop_loading (view);
+
+    /* Clear any active filter when navigating to a new directory */
+    view->details->filter_navigation_blocked = FALSE;
+
+    if (view->details->filter_active) {
+        reset_filter_state (view);
+        NEMO_VIEW_CLASS (G_OBJECT_GET_CLASS (view))->update_filter_text (view, NULL);
+    }
+
 	g_signal_emit (view, signals[CLEAR], 0);
 
 	view->details->loading = TRUE;
+	view->details->loading_pending_held = 0;
+	view->details->display_method = "progressive";
+	view->details->first_render_elapsed = -1.0;
 
 	/* Update menus when directory is empty, before going to new
 	 * location, so they won't have any false lingering knowledge
@@ -10482,7 +10575,7 @@ finish_loading (NemoView *view)
 		 * (cached) deep counts.
 		 */
 		unschedule_display_of_pending_files (view);
-		schedule_timeout_display_of_pending_files (view, UPDATE_INTERVAL_MIN);
+		schedule_timeout_display_of_pending_files (view, UPDATE_INTERVAL_DEFERRED);
 	}
 
 	/* Start loading. */
@@ -10723,9 +10816,266 @@ real_is_read_only (NemoView *view)
 gboolean
 nemo_view_should_show_file (NemoView *view, NemoFile *file)
 {
-	return nemo_file_should_show (file,
-					  view->details->show_hidden_files,
-					  view->details->show_foreign_files);
+    if (!nemo_file_should_show (file,
+                                view->details->show_hidden_files,
+                                view->details->show_foreign_files))
+    {
+        return FALSE;
+    }
+
+    if (view->details->filter_active &&
+        nemo_view_get_filter_match (view, file) == NEMO_FILTER_NO_MATCH)
+    {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+gint
+nemo_view_get_filter_match (NemoView *view, NemoFile *file)
+{
+    char *display_name, *stripped;
+    score_t score;
+    gint result;
+    gpointer cached;
+
+    g_return_val_if_fail (NEMO_IS_VIEW (view), NEMO_FILTER_NO_MATCH);
+
+    if (!view->details->filter_active || view->details->filter_text_stripped == NULL) {
+        return 0;
+    }
+
+    if (g_hash_table_lookup_extended (view->details->filter_score_cache,
+                                      file, NULL, &cached))
+    {
+        return GPOINTER_TO_INT (cached);
+    }
+
+    display_name = nemo_file_get_display_name (file);
+    if (display_name == NULL) {
+        result = NEMO_FILTER_NO_MATCH;
+        g_hash_table_insert (view->details->filter_score_cache,
+                             file, GINT_TO_POINTER (result));
+        return result;
+    }
+
+    stripped = nemo_fzy_strip_combining_marks (display_name, NULL);
+    g_free (display_name);
+
+    if (!has_match (view->details->filter_text_stripped, stripped)) {
+        g_free (stripped);
+        result = NEMO_FILTER_NO_MATCH;
+        g_hash_table_insert (view->details->filter_score_cache,
+                             file, GINT_TO_POINTER (result));
+        return result;
+    }
+
+    score = match (view->details->filter_text_stripped, stripped);
+    g_free (stripped);
+
+    /* Convert fzy score (higher=better) to our sort rank (lower=better).
+     * Scale by 1000 to preserve meaningful precision in the integer. */
+    if (score == SCORE_MAX) {
+        result = G_MININT;
+    } else if (score == SCORE_MIN) {
+        result = G_MAXINT - 1;
+    } else {
+        result = (gint) CLAMP (-score * 1000.0, (double) G_MININT + 1, (double) G_MAXINT - 2);
+    }
+
+    g_hash_table_insert (view->details->filter_score_cache,
+                         file, GINT_TO_POINTER (result));
+
+    return result;
+}
+
+gboolean
+nemo_view_get_filter_active (NemoView *view)
+{
+    g_return_val_if_fail (NEMO_IS_VIEW (view), FALSE);
+    return view->details->filter_active;
+}
+
+const char *
+nemo_view_get_filter_text (NemoView *view)
+{
+    g_return_val_if_fail (NEMO_IS_VIEW (view), NULL);
+    return view->details->filter_text;
+}
+
+static void
+reset_filter_state (NemoView *view)
+{
+    if (view->details->filter_debounce_id != 0) {
+        g_source_remove (view->details->filter_debounce_id);
+        view->details->filter_debounce_id = 0;
+    }
+
+    g_clear_pointer (&view->details->filter_text, g_free);
+    g_clear_pointer (&view->details->filter_text_stripped, g_free);
+    g_hash_table_remove_all (view->details->filter_score_cache);
+    view->details->filter_active = FALSE;
+}
+
+static gboolean
+apply_filter_debounce_cb (gpointer data)
+{
+    NemoView *view = NEMO_VIEW (data);
+
+    view->details->filter_debounce_id = 0;
+
+    NEMO_VIEW_CLASS (G_OBJECT_GET_CLASS (view))->update_filter_text (view, view->details->filter_text);
+    nemo_view_apply_filter (view);
+
+    /* Re-emit so the slot can update the "no matching files" indicator
+     * now that apply_filter has updated the view contents. */
+    g_signal_emit (view, signals[ACTIVATE_FILTER], 0, view->details->filter_text);
+
+    return G_SOURCE_REMOVE;
+}
+
+void
+nemo_view_set_filter_text (NemoView *view, const char *text)
+{
+    g_return_if_fail (NEMO_IS_VIEW (view));
+
+    reset_filter_state (view);
+
+    if (text != NULL && text[0] != '\0') {
+        view->details->filter_text = g_strdup (text);
+        view->details->filter_text_stripped = nemo_fzy_strip_combining_marks (text, NULL);
+        view->details->filter_navigation_blocked = TRUE;
+        view->details->filter_active = TRUE;
+    }
+
+    g_signal_emit (view, signals[ACTIVATE_FILTER], 0, view->details->filter_text);
+
+    view->details->filter_debounce_id = g_timeout_add (100, apply_filter_debounce_cb, view);
+}
+
+void
+nemo_view_clear_filter (NemoView *view)
+{
+    g_return_if_fail (NEMO_IS_VIEW (view));
+
+    if (!view->details->filter_active) {
+        return;
+    }
+
+    reset_filter_state (view);
+
+    g_signal_emit (view, signals[ACTIVATE_FILTER], 0, NULL);
+
+    nemo_view_apply_filter (view);
+
+    NEMO_VIEW_CLASS (G_OBJECT_GET_CLASS (view))->update_filter_text (view, NULL);
+}
+
+gboolean
+nemo_view_activate_filter (NemoView *view, GdkEventKey *event)
+{
+    guint32 unicode_ch;
+
+    g_return_val_if_fail (NEMO_IS_VIEW (view), FALSE);
+
+    if (event == NULL) {
+        return FALSE;
+    }
+
+    if ((event->state & (GDK_CONTROL_MASK | GDK_MOD1_MASK)) != 0) {
+        return FALSE;
+    }
+
+    if (view->details->model != NULL &&
+        NEMO_IS_SEARCH_DIRECTORY (view->details->model)) {
+        return FALSE;
+    }
+
+    /* Escape clears an active filter */
+    if (event->keyval == GDK_KEY_Escape && view->details->filter_active) {
+        nemo_view_clear_filter (view);
+        return TRUE;
+    }
+
+    /* Backspace removes the last character from the filter, or is
+     * consumed (no-op) while navigation is blocked after filtering. */
+    if (event->keyval == GDK_KEY_BackSpace &&
+        (view->details->filter_active || view->details->filter_navigation_blocked)) {
+
+        if (!view->details->filter_active) {
+            return TRUE;
+        }
+        const char *text = view->details->filter_text;
+        glong len = g_utf8_strlen (text, -1);
+
+        if (len <= 1) {
+            nemo_view_clear_filter (view);
+        } else {
+            gchar *new_text = g_strndup (text, g_utf8_offset_to_pointer (text, len - 1) - text);
+            nemo_view_set_filter_text (view, new_text);
+            g_free (new_text);
+        }
+
+        return TRUE;
+    }
+
+    /* Printable characters append to the filter.
+     * Space only appends if filter is already active. */
+    unicode_ch = gdk_keyval_to_unicode (event->keyval);
+
+    if (unicode_ch != 0 && g_unichar_isprint (unicode_ch) &&
+        (unicode_ch != ' ' || view->details->filter_active)) {
+        gchar buf[6];
+        gint char_len;
+        gchar *new_text;
+
+        char_len = g_unichar_to_utf8 (unicode_ch, buf);
+        buf[char_len] = '\0';
+
+        if (view->details->filter_text != NULL) {
+            new_text = g_strconcat (view->details->filter_text, buf, NULL);
+        } else {
+            new_text = g_strdup (buf);
+        }
+
+        nemo_view_set_filter_text (view, new_text);
+        g_free (new_text);
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static void
+nemo_view_apply_filter (NemoView *view)
+{
+    NemoDirectory *directory;
+    GList *all_files, *l;
+
+    directory = view->details->model;
+
+    if (directory == NULL) {
+        return;
+    }
+
+    all_files = nemo_directory_get_file_list (directory);
+
+    g_signal_emit (view, signals[BEGIN_FILE_CHANGES], 0);
+
+    for (l = all_files; l != NULL; l = l->next) {
+        NemoFile *file = l->data;
+
+        if (nemo_view_should_show_file (view, file)) {
+            g_signal_emit (view, signals[ADD_FILE], 0, file, directory);
+        } else {
+            g_signal_emit (view, signals[REMOVE_FILE], 0, file, directory);
+        }
+    }
+
+    g_signal_emit (view, signals[END_FILE_CHANGES], 0);
+
+    nemo_file_list_free (all_files);
 }
 
 static gboolean
@@ -10734,6 +11084,11 @@ real_using_manual_layout (NemoView *view)
 	g_return_val_if_fail (NEMO_IS_VIEW (view), FALSE);
 
 	return FALSE;
+}
+
+static void
+real_update_filter_text (NemoView *view, const char *filter_text)
+{
 }
 
 static void
@@ -11174,14 +11529,14 @@ nemo_view_class_init (NemoViewClass *klass)
 			      g_signal_accumulator_true_handled, NULL,
 			      g_cclosure_marshal_generic,
 			      G_TYPE_BOOLEAN, 0);
-    signals[SHOW_DROP_BAR] =
-        g_signal_new ("show-drop-bar",
+    signals[ACTIVATE_FILTER] =
+        g_signal_new ("activate-filter",
                   G_TYPE_FROM_CLASS (klass),
                   G_SIGNAL_RUN_LAST,
                   0,
                   NULL, NULL,
-                  g_cclosure_marshal_VOID__VOID,
-                  G_TYPE_NONE, 0);
+                  g_cclosure_marshal_VOID__STRING,
+                  G_TYPE_NONE, 1, G_TYPE_STRING);
 
 	klass->get_selected_icon_locations = real_get_selected_icon_locations;
 	klass->is_read_only = real_is_read_only;
@@ -11193,6 +11548,7 @@ nemo_view_class_init (NemoViewClass *klass)
         klass->merge_menus = real_merge_menus;
         klass->unmerge_menus = real_unmerge_menus;
         klass->update_menus = real_update_menus;
+	klass->update_filter_text = real_update_filter_text;
 	klass->trash = real_trash;
 	klass->delete = real_delete;
 
